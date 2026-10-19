@@ -1,18 +1,29 @@
-"""Naive (intentionally unsafe) seat-hold logic — the Stage 2 race demo.
+"""Concurrency-safe seat-hold logic.
 
-This checks seat availability and inserts the hold as two separate
-statements with no transaction-level or DB-level protection between them:
-two concurrent requests can both see the seat as free and both insert.
-Migration 0002 drops the partial unique index precisely so nothing backs
-this up at the DB layer either. Stage 3 replaces this function's body with
-a concurrency-safe strategy and migration 0003 restores the index.
+Two interchangeable strategies, selected via Settings.BOOKING_STRATEGY so
+they can be compared directly in the load test:
+
+  A) partial-unique-index insert -- optimistic: just attempt the insert and
+     let the DB's partial unique index (uq_bookings_active_seat) reject a
+     second active booking on the same seat with a unique-violation.
+  B) SELECT ... FOR UPDATE -- pessimistic: lock the seat row first, so only
+     one transaction at a time can even reach the insert for that seat.
+
+Neither strategy uses an app-level lock or in-memory state, so both are safe
+across any number of API instances. Stage 2's naive version (a plain
+SELECT-then-INSERT with nothing synchronizing them) lived in this file first
+and is preserved in git history; this replaces it.
 """
 from dataclasses import dataclass
 
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, errors
 
 
 class SeatTakenError(Exception):
+    pass
+
+
+class SeatNotFoundError(Exception):
     pass
 
 
@@ -24,33 +35,94 @@ class Booking:
     status: str
 
 
-async def naive_create_hold(
+async def _expire_stale_holds(cur, seat_id: int) -> None:
+    await cur.execute(
+        """
+        UPDATE bookings
+        SET status = 'expired', updated_at = now()
+        WHERE seat_id = %(seat_id)s
+          AND status IN ('held', 'pending_payment')
+          AND hold_expires_at <= now()
+        """,
+        {"seat_id": seat_id},
+    )
+
+
+async def _insert_hold(cur, user_id: int, seat_id: int, hold_minutes: int) -> Booking:
+    await cur.execute(
+        """
+        INSERT INTO bookings (user_id, seat_id, status, hold_expires_at)
+        VALUES (%(user_id)s, %(seat_id)s, 'held', now() + (%(minutes)s * interval '1 minute'))
+        RETURNING id, seat_id, user_id, status
+        """,
+        {"user_id": user_id, "seat_id": seat_id, "minutes": hold_minutes},
+    )
+    row = await cur.fetchone()
+    return Booking(id=row[0], seat_id=row[1], user_id=row[2], status=row[3])
+
+
+async def strategy_a_create_hold(
     conn: AsyncConnection, user_id: int, seat_id: int, hold_minutes: int
 ) -> Booking:
-    async with conn.cursor() as cur:
-        await cur.execute(
-            """
-            SELECT 1 FROM bookings
-            WHERE seat_id = %(seat_id)s
-              AND (
-                status = 'confirmed'
-                OR (status IN ('held', 'pending_payment') AND hold_expires_at > now())
-              )
-            """,
-            {"seat_id": seat_id},
-        )
-        if await cur.fetchone() is not None:
-            raise SeatTakenError()
+    """One transaction: expire this seat's stale holds, then insert. A
+    concurrent winner's commit makes our insert violate
+    uq_bookings_active_seat -- we catch that and report 409. READ COMMITTED
+    (Postgres's default) is enough: correctness comes from the unique index,
+    not from the isolation level.
+    """
+    try:
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await _expire_stale_holds(cur, seat_id)
+                booking = await _insert_hold(cur, user_id, seat_id, hold_minutes)
+    except errors.UniqueViolation:
+        raise SeatTakenError()
+    return booking
 
-        await cur.execute(
-            """
-            INSERT INTO bookings (user_id, seat_id, status, hold_expires_at)
-            VALUES (%(user_id)s, %(seat_id)s, 'held', now() + (%(minutes)s * interval '1 minute'))
-            RETURNING id, seat_id, user_id, status
-            """,
-            {"user_id": user_id, "seat_id": seat_id, "minutes": hold_minutes},
-        )
-        row = await cur.fetchone()
 
-    await conn.commit()
-    return Booking(id=row[0], seat_id=row[1], user_id=row[2], status=row[3])
+async def strategy_b_create_hold(
+    conn: AsyncConnection, user_id: int, seat_id: int, hold_minutes: int
+) -> Booking:
+    """Locking the seat row serializes every concurrent attempt on it: only
+    one transaction reaches the insert at a time, so the second one's
+    re-check of active bookings sees the first one's already-committed row
+    and reports 409 before ever attempting an insert.
+    """
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id FROM seats WHERE id = %(seat_id)s FOR UPDATE",
+                {"seat_id": seat_id},
+            )
+            if await cur.fetchone() is None:
+                raise SeatNotFoundError()
+
+            await _expire_stale_holds(cur, seat_id)
+
+            await cur.execute(
+                """
+                SELECT 1 FROM bookings
+                WHERE seat_id = %(seat_id)s
+                  AND status IN ('held', 'pending_payment', 'confirmed')
+                """,
+                {"seat_id": seat_id},
+            )
+            if await cur.fetchone() is not None:
+                raise SeatTakenError()
+
+            booking = await _insert_hold(cur, user_id, seat_id, hold_minutes)
+    return booking
+
+
+async def create_hold(
+    conn: AsyncConnection,
+    user_id: int,
+    seat_id: int,
+    hold_minutes: int,
+    strategy: str,
+) -> Booking:
+    if strategy == "A":
+        return await strategy_a_create_hold(conn, user_id, seat_id, hold_minutes)
+    if strategy == "B":
+        return await strategy_b_create_hold(conn, user_id, seat_id, hold_minutes)
+    raise ValueError(f"unknown booking strategy: {strategy!r}")

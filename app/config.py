@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,7 +17,7 @@ class Settings(BaseSettings):
     POOL_MAX: int = 10
 
     HOLD_DURATION_MINUTES: int = 5
-    BOOKING_STRATEGY: str = "A"
+    BOOKING_STRATEGY: Literal["A", "B"] = "A"
 
     WEBHOOK_HMAC_SECRET: str
     IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS: int = 30

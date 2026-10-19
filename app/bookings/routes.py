@@ -2,7 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from psycopg import AsyncConnection
 from pydantic import BaseModel
 
-from app.bookings.repository import Booking, SeatTakenError, naive_create_hold
+from app.bookings.repository import (
+    Booking,
+    SeatNotFoundError,
+    SeatTakenError,
+    create_hold,
+)
 from app.config import get_settings
 from app.db import get_conn
 
@@ -35,15 +40,21 @@ async def create_booking(
     body: CreateBookingRequest,
     conn: AsyncConnection = Depends(get_conn),
 ) -> BookingResponse:
-    """Stage 2 naive implementation: no auth, no Idempotency-Key, no state
-    machine yet — those arrive in later stages. This handler exists only to
-    demonstrate the double-booking race; Stage 3 replaces its body.
+    """Stage 3: concurrency-safe hold creation via the configured strategy
+    (Settings.BOOKING_STRATEGY). Still no auth, Idempotency-Key, or state
+    machine -- those arrive in later stages.
     """
     settings = get_settings()
     try:
-        booking = await naive_create_hold(
-            conn, body.user_id, body.seat_id, settings.HOLD_DURATION_MINUTES
+        booking = await create_hold(
+            conn,
+            body.user_id,
+            body.seat_id,
+            settings.HOLD_DURATION_MINUTES,
+            settings.BOOKING_STRATEGY,
         )
     except SeatTakenError:
         raise HTTPException(status_code=409, detail="seat already taken")
+    except SeatNotFoundError:
+        raise HTTPException(status_code=404, detail="seat not found")
     return BookingResponse.from_booking(booking)

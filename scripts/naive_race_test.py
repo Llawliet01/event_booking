@@ -63,9 +63,9 @@ def main() -> None:
     print(f"Active bookings now sitting on seat_id={SEAT_ID}: {active}")
 
     if active > 1:
-        print(f"DOUBLE BOOKING CONFIRMED: {active} active bookings on one seat.")
+        print(f"DOUBLE BOOKING: {active} active bookings ended up on one seat.")
     else:
-        print("No double booking observed this run (race window not hit).")
+        print(f"No double booking: exactly {active} active booking on the seat.")
 
 
 if __name__ == "__main__":

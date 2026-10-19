@@ -59,5 +59,38 @@ proceeds to `INSERT`. The very first invocation after the pool has just opened c
 since the first few connections are still being established sequentially rather than firing
 together; re-running once the pool is warm reproduces it reliably.
 
+## Stage 3: the fix — two interchangeable strategies, same proof script
+
+Migration `0003` restores `uq_bookings_active_seat`. Because Stage 2's own proof run left
+genuine duplicate active bookings on seat 1, the migration first resolves those (keeps the
+earliest, expires the rest) before re-creating the constraint — the same move you'd make
+against real production data when retrofitting a uniqueness guarantee.
+
+`app/bookings/repository.py` now offers two concurrency-safe strategies, chosen by the
+`BOOKING_STRATEGY` env var (`A` or `B`, default `A`) so they can be compared later in the k6
+load test:
+- **A — partial-unique-index insert.** One transaction: expire this seat's stale holds, then
+  insert. If a concurrent request already won, our insert violates the (now-restored) unique
+  index; we catch that and return 409. `READ COMMITTED` (Postgres's default) is enough —
+  correctness comes from the index, not the isolation level.
+- **B — `SELECT ... FOR UPDATE`.** Locks the seat row first, so concurrent attempts on that
+  seat serialize: only one transaction reaches the insert at a time, and the loser's
+  re-check of active bookings sees the winner's already-committed row.
+
+Neither uses an app-level lock, a global lock, or in-memory state — both are safe with
+multiple API instances because the guarantee lives entirely in Postgres.
+
+Re-running the *exact same* proof script from Stage 2 (`python scripts/naive_race_test.py`,
+200 concurrent requests at seat 1) against each strategy, 3 runs each, local machine,
+`POOL_MAX=10`:
+```
+Status codes: {201: 1, 409: 199}
+Active bookings now sitting on seat_id=1: 1
+No double booking: exactly 1 active booking on the seat.
+```
+Identical result for both `BOOKING_STRATEGY=A` and `BOOKING_STRATEGY=B`, every run: exactly
+one booking succeeds, 199 get 409, and the DB confirms exactly one active booking on the seat
+— a direct before/after contrast with Stage 2's `{201: 10, 409: 190}`.
+
 Later stages will add auth, idempotency, payments, tests, k6 load tests, and the full README
 (live demo URL, demo credentials, measured benchmark results).
