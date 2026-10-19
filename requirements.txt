@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+psycopg[binary,pool]==3.2.3
+alembic==1.13.3
+sqlalchemy==2.0.36
+pydantic-settings==2.6.0
+pyjwt==2.9.0
+argon2-cffi==23.1.0
+structlog==24.4.0
+prometheus-client==0.21.0

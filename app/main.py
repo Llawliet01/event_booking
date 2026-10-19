@@ -1,0 +1,34 @@
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import get_settings
+from app.db import close_pool, open_pool
+from app.health.routes import router as health_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await open_pool()
+    yield
+    await close_pool()
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(title="Event Booking API", lifespan=lifespan)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.CORS_ALLOWED_ORIGIN],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    app.include_router(health_router)
+    return app
+
+
+app = create_app()
