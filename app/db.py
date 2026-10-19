@@ -1,3 +1,6 @@
+from collections.abc import AsyncIterator
+
+from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool
 
 from app.config import get_settings
@@ -31,3 +34,9 @@ def get_pool() -> AsyncConnectionPool:
     if _pool is None:
         raise RuntimeError("Connection pool is not open yet")
     return _pool
+
+
+async def get_conn() -> AsyncIterator[AsyncConnection]:
+    """FastAPI dependency: checks out a pooled connection for one request."""
+    async with get_pool().connection() as conn:
+        yield conn
