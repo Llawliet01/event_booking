@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS: int = 30
     IDEMPOTENCY_KEY_RETENTION_DAYS: int = 7
 
+    PAYMENT_AMOUNT_CENTS: int = 5000
+    PAYMENT_SIMULATOR_DELAY_SECONDS: float = 1.0
+
     CORS_ALLOWED_ORIGIN: str = "http://localhost:3000"
     PORT: int = 8000
     ENV: str = "development"

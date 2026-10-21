@@ -1,6 +1,6 @@
 # Event Booking Backend
 
-Concurrency-safe seat booking API. Full design rationale lives in [DESIGN.md](DESIGN.md) (added from Stage 6 onward).
+Concurrency-safe seat booking API. Full design rationale lives in [DESIGN.md](DESIGN.md).
 
 ## Local development (Stage 1: schema + health only, no booking logic yet)
 
@@ -168,5 +168,53 @@ doesn't leave much room for):
   `IN_PROGRESS`. Both are correct outcomes of the same mechanism; which one you see depends on
   how long the claimed request takes to finish.
 
-Later stages will add payments, tests, k6 load tests, and the full README (live demo URL,
-demo credentials, measured benchmark results).
+## Stage 6: payment simulation, signed idempotent webhook, reconciliation
+
+- **`POST /bookings/{id}/pay`** — `held -> pending_payment`, marking the booking `expired`
+  instead if its hold had already lapsed (409). On success it schedules
+  `app/payments/provider_simulator.py` as a FastAPI background task: after a short delay it
+  HMAC-signs a fake event and does a real HTTP POST to our own `/webhooks/payment`, the same
+  path a real provider's callback would take from the outside.
+- **`POST /webhooks/payment`** — verifies the signature over the raw request body (not a
+  re-serialized model, which could reorder keys and break the signature), dedupes by
+  `event_id` (its own primary key), then records a `payments` row and conditionally confirms
+  the booking — dedupe, record, and confirm all in one transaction
+  (`app/payments/repository.py`), so a crash anywhere rolls back everything including the
+  dedupe row, and a provider retry replays cleanly.
+- **`app/bookings/reconciliation.py`** — `reconcile_payments()` re-derives the invariant "a
+  succeeded payment implies a confirmed booking or an explicit `needs_review` flag" and fixes
+  any violation, independent of how it happened (crash, bug, bad migration). Same
+  not-wired-to-a-scheduler pattern as the other job hooks.
+
+Verified live end to end, including the cases that don't show up from the happy path alone:
+- Full flow: book → pay (`pending_payment`) → simulated signed webhook lands ~1s later →
+  `confirmed`, with a correct `payments` row (`status=succeeded, needs_review=false`).
+- Bad signature → `401`. Malformed payload → `422`. Unknown `booking_id` → `404`.
+- The exact same webhook event posted twice → `webhook_events` and `payments` both show
+  exactly one row for it — the second delivery is a true no-op, not just a 200 that hides a
+  duplicate write.
+- **Hold expired before the payment succeeded**: forced a hold into the past, then sent a
+  validly-signed `succeeded` webhook for it directly (bypassing the simulator's timing, to
+  remove any race with the background task) — the booking stayed `pending_payment` (never
+  confirmed) and the payment landed with `needs_review=true, refund_status='pending'`.
+- **Failed payment**: a `failed` webhook event cancelled the booking (freeing the seat); a
+  *different*, later `succeeded` event for the same booking (the automatic simulator's own
+  callback, arriving after) did not un-cancel it — the confirm step only ever fires from
+  `pending_payment`, which this booking had already left.
+- **Reconciliation**: manually constructed the "crash between payment and confirm" state
+  directly in Postgres (bypassing the webhook handler entirely — a `pending_payment` booking
+  with an unflagged `succeeded` payment row), ran `reconcile_payments()`, and confirmed it
+  found and flagged exactly that row (`needs_review` false → true, `refund_status` ·
+  `not_required` → `pending`); a second pass found nothing left to fix.
+
+One timing lesson from this stage worth keeping: an early version of the hold-expiry test gave
+a false pass, because the several sequential `docker exec`/`curl` calls in a shell script ate
+more wall-clock time than the 1-second simulated payment delay, so the *automatic* webhook
+callback landed and confirmed the booking before the test's own "force the hold into the past"
+step ever ran. Rewriting the test as a single async Python script with precise control over
+ordering (and bypassing the automatic callback by sending a hand-crafted webhook instead)
+removed the ambiguity. The lesson generalizes: a test that measures something time-sensitive
+needs to control time, not just hope its own overhead stays small enough.
+
+Later stages will add the test suite, CI, observability, k6 load tests, and the full README
+(live demo URL, demo credentials, measured benchmark results).

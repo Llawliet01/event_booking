@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse
 from psycopg import AsyncConnection
 from pydantic import BaseModel
@@ -14,6 +14,7 @@ from app.bookings.repository import (
     cancel_booking,
     create_hold,
     list_bookings_for_user,
+    start_payment,
 )
 from app.config import get_settings
 from app.db import get_conn
@@ -23,6 +24,7 @@ from app.idempotency.repository import (
     complete_idempotent_request,
     compute_request_hash,
 )
+from app.payments.provider_simulator import schedule_payment_callback
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
@@ -111,6 +113,41 @@ async def create_booking(
 
     await complete_idempotent_request(conn, user_id, idempotency_key, response_code, response_body)
     return JSONResponse(status_code=response_code, content=response_body)
+
+
+@router.post("/{booking_id}/pay", response_model=BookingResponse)
+async def pay(
+    booking_id: int,
+    background_tasks: BackgroundTasks,
+    user_id: int = Depends(get_current_user_id),
+    conn: AsyncConnection = Depends(get_conn),
+) -> BookingResponse:
+    """held -> pending_payment, then schedules a simulated provider
+    callback (a real HTTP POST to our own /webhooks/payment, signed the
+    same way a real provider's callback would be) to land shortly after
+    this response. No Idempotency-Key here -- only POST /bookings needs
+    one per the spec.
+    """
+    settings = get_settings()
+    try:
+        booking = await start_payment(conn, booking_id, user_id)
+    except BookingNotFoundError:
+        raise HTTPException(status_code=404, detail="booking not found")
+    except NotOwnerError:
+        raise HTTPException(status_code=403, detail="not your booking")
+    except InvalidTransitionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    background_tasks.add_task(
+        schedule_payment_callback,
+        base_url=f"http://127.0.0.1:{settings.PORT}",
+        secret=settings.WEBHOOK_HMAC_SECRET,
+        booking_id=booking.id,
+        amount_cents=settings.PAYMENT_AMOUNT_CENTS,
+        outcome="succeeded",
+        delay_seconds=settings.PAYMENT_SIMULATOR_DELAY_SECONDS,
+    )
+    return BookingResponse.from_booking(booking)
 
 
 @router.post("/{booking_id}/cancel", response_model=BookingResponse)

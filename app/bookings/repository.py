@@ -184,6 +184,54 @@ async def cancel_booking(conn: AsyncConnection, booking_id: int, user_id: int) -
     return Booking(id=updated[0], seat_id=updated[1], user_id=updated[2], status=updated[3])
 
 
+async def start_payment(conn: AsyncConnection, booking_id: int, user_id: int) -> Booking:
+    """held -> pending_payment. If the hold had already lapsed, it's marked
+    'expired' right here instead of silently left 'held' -- so availability
+    reflects reality immediately rather than waiting for the next hold
+    attempt's lazy-expiry sweep on that seat. Mirrors the SELECT/expire/
+    transition shape of strategy_a_create_hold.
+    """
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, user_id, status FROM bookings WHERE id = %(id)s FOR UPDATE",
+                {"id": booking_id},
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise BookingNotFoundError()
+
+            _, owner_id, original_status = row
+            if owner_id != user_id:
+                raise NotOwnerError()
+
+            await cur.execute(
+                """
+                UPDATE bookings
+                SET status = 'expired', updated_at = now()
+                WHERE id = %(id)s AND status = 'held' AND hold_expires_at <= now()
+                """,
+                {"id": booking_id},
+            )
+            if cur.rowcount > 0:
+                raise InvalidTransitionError("held", "pending_payment")
+
+            await cur.execute(
+                """
+                UPDATE bookings
+                SET status = 'pending_payment', updated_at = now()
+                WHERE id = %(id)s AND status = 'held' AND hold_expires_at > now()
+                RETURNING id, seat_id, user_id, status
+                """,
+                {"id": booking_id},
+            )
+            updated = await cur.fetchone()
+            if updated is None:
+                raise InvalidTransitionError(original_status, "pending_payment")
+
+    return Booking(id=updated[0], seat_id=updated[1], user_id=updated[2], status=updated[3])
+
+
 async def list_bookings_for_user(conn: AsyncConnection, user_id: int) -> list[Booking]:
     async with conn.cursor() as cur:
         await cur.execute(
