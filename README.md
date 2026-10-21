@@ -1,6 +1,27 @@
 # Event Booking Backend
 
-Concurrency-safe seat booking API. Full design rationale lives in [DESIGN.md](DESIGN.md).
+A concurrency-safe seat booking API: many users can try to book the same seat at the same
+instant, and exactly one succeeds — proven under 500+ concurrent requests, across crashes,
+retries, and payment webhooks delivered twice or out of order. Full design rationale lives in
+[DESIGN.md](DESIGN.md).
+
+**Stack**: Python 3.12, FastAPI (async), PostgreSQL 16, hand-written SQL on the booking/locking
+critical path (no ORM there), psycopg3, Alembic, JWT auth (argon2), pytest against real
+Postgres, k6, Docker Compose, GitHub Actions.
+
+**Endpoints**: `POST /auth/register`, `POST /auth/login`, `GET /events`,
+`GET /events/{id}/seats`, `POST /bookings` (requires `Idempotency-Key`),
+`POST /bookings/{id}/pay`, `POST /webhooks/payment`, `POST /bookings/{id}/cancel`,
+`GET /bookings/me`, `GET /health`, `GET /health/ready`, `GET /metrics`.
+
+**Fast paths into this README**: `pytest tests/` runs all 45 tests against a real Postgres, no
+mocks; [Stage 8](#stage-8-k6-load-tests) has the load test results, measured and independently
+verified against the database; [Deployment](#deployment) covers Render + Neon setup.
+
+Everything below is a build log, in stage order: each stage's design decisions, what was
+actually verified and how, and — a few times — a bug the verification itself caught. That
+history is kept rather than rewritten into one clean final document, because the mistakes and
+fixes are as much the point of this project as the finished code.
 
 ## Local development (Stage 1: schema + health only, no booking logic yet)
 
@@ -288,5 +309,95 @@ the thing this project's "no in-memory state" rule actually protects). Verified 
 login attempts against a limit of 5/min returned `401, 401, 401, 429, 429, 429, 429` — the exact
 cutoff, accounting for 2 earlier auth calls already counted in that same window.
 
-Later stages will add k6 load tests and the full README (live demo URL, demo credentials,
-measured benchmark results).
+## Stage 8: k6 load tests
+
+Run via k6's official Docker image (no local k6 install needed) against the real stack
+(`docker compose up -d --build`):
+```
+python scripts/k6_setup.py   # generates benchmarks/k6/fixtures.json: users (JWTs minted
+                              # directly, bypassing the auth rate limit), a 1-seat event, a
+                              # 100-seat event
+
+docker run --rm --network eventbookingproject_default \
+  -v "$(pwd)/benchmarks/k6:/scripts" -e BASE_URL=http://api:8000 \
+  grafana/k6 run --summary-trend-stats="avg,min,med,max,p(90),p(95),p(99)" \
+  --summary-export=/scripts/hotspot-result.json /scripts/hotspot.js
+
+docker run --rm --network eventbookingproject_default \
+  -v "$(pwd)/benchmarks/k6:/scripts" -e BASE_URL=http://api:8000 \
+  grafana/k6 run --summary-trend-stats="avg,min,med,max,p(90),p(95),p(99)" \
+  --summary-export=/scripts/spread-result.json /scripts/spread.js
+```
+`hotspot.js` fires 300 VUs at one seat (1 iteration each); `spread.js` fires 500 VUs across 100
+seats (5 per seat). Switch `BOOKING_STRATEGY` in `.env` and `docker compose up -d api` between
+runs to compare strategies. Raw k6 summaries are in `/benchmarks/results`.
+
+**Measured results** (local machine: Windows 11, Docker Desktop, Postgres 16 and the API both
+in containers on the same machine, `POOL_MAX=10`; k6 running in its own container on the same
+Docker network as the API):
+
+| Scenario | Strategy | Successes | Duplicates | p50 | p95 | p99 | req/s |
+|---|---|---|---|---|---|---|---|
+| 300 VUs → 1 seat | A | 1 (verified in DB) | 0 | 1085 ms | 1587 ms | 1613 ms | 175.4 |
+| 300 VUs → 1 seat | B | 1 (verified in DB) | 0 | 1060 ms | 1508 ms | 1540 ms | 183.5 |
+| 500 VUs → 100 seats | A | 100 (verified in DB) | 0 | 1417 ms | 2156 ms | 2219 ms | 209.6 |
+| 500 VUs → 100 seats | B | 100 (verified in DB) | 0 | 3328 ms | 4457 ms | 4581 ms | 106.1 |
+
+Error rate: 0% in the sense that matters — every non-`201` response was an expected `409`
+(k6's own `checks` passed 100% on "status is 201 or 409" in every run). k6's generic
+`http_req_failed` metric shows ~80-99.66%, because it counts any non-2xx response as "failed"
+by default; that metric is meaningless here on its own, since getting exactly the right number
+of 409s is the entire point of the test. "Successes" and "duplicates" above were verified by
+querying Postgres directly after every run, not by trusting k6's status-code counts.
+
+**On the latency numbers, honestly**: the very first spread-scenario run of the session (before
+Postgres's buffer cache had been touched by any load test) measured p95 = 13.16s — over 6x
+every subsequent run, strategy held constant. Re-running the identical scenario and strategy
+immediately after brought it down to the 2-4s range seen in later runs, with no code or config
+change — just a warmer Postgres. The table above uses the final, mutually-comparable set of
+four runs (all with an already-warm Postgres, run back-to-back), but even within that set,
+Strategy B's spread run (p95 = 4.46s) looks markedly slower than Strategy A's (p95 = 2.16s) in
+*this* run, which contradicts an earlier exploratory run where B looked faster. **This single
+shared laptop running Docker Desktop, Postgres, the API, and k6 all at once is not a controlled
+benchmarking environment**, and four runs is not enough trials to average out that noise. The
+one claim this data actually supports with confidence is correctness: every run, every
+scenario, every strategy produced exactly the expected number of successful bookings with zero
+duplicates, confirmed against the database directly. A real A-vs-B latency verdict would need
+many repeated trials on dedicated hardware with nothing else competing for CPU/IO — exactly the
+kind of rigor called out in [DESIGN.md](DESIGN.md)'s "what I would do at scale" section.
+
+## Deployment
+
+**Live demo**: not yet deployed — see below for how to deploy this yourself. Fill in the URL,
+demo credentials, and cold-start note here once you have a live Render/Neon deployment:
+```
+Live demo: <your-render-url>
+First request may take ~1 minute (free tier cold start).
+Demo login: demo@example.com / demo12345 (seeded by scripts/seed.py)
+API docs: <your-render-url>/docs
+```
+
+**To deploy (Render + Neon, both free tier):**
+1. Create a Neon Postgres project. Copy its connection string as `DATABASE_URL`.
+2. Create a Render Web Service from this repo, environment "Docker" (uses the existing
+   `Dockerfile`, which already listens on `$PORT` and runs `alembic upgrade head` before
+   `uvicorn` on every boot — no separate release step needed). `render.yaml` in the repo root
+   is a Render Blueprint with every env var this app reads already listed (secrets marked
+   `sync: false` so Render prompts for them instead of needing a value here) — use "New
+   Blueprint" on Render and point it at this repo instead of configuring the service by hand.
+3. Set these env vars on the Render service (see `.env.example` for the full list and
+   defaults): `DATABASE_URL` (from Neon), `JWT_SECRET`, `WEBHOOK_HMAC_SECRET` (generate real
+   random values, don't reuse the placeholders), `CORS_ALLOWED_ORIGIN` (your frontend's
+   origin, if any), `POOL_MIN`/`POOL_MAX` (keep small — Neon's free tier and Render's free
+   tier both cap connections).
+4. After the first deploy succeeds, run `python scripts/seed.py` once against the Neon
+   `DATABASE_URL` (locally, pointed at the remote DB) to create the demo user/event/seats.
+5. `.github/workflows/deploy.yml` hits Render's deploy hook on every push to `main` — add the
+   hook URL (from the Render service's Settings → Deploy Hook) as the `RENDER_DEPLOY_HOOK`
+   repo secret for this to work.
+
+**Known gap**: `GET /metrics` must be kept off the public internet per the project's own
+constraints, but nothing at the application layer enforces that here — it's an infra-level
+concern (e.g. a Render-side path restriction, or a separate internal-only service) that depends
+on specifics of wherever this actually gets deployed, so it's called out here rather than
+guessed at in code.

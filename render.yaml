@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: event-booking-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: JWT_EXPIRE_MINUTES
+        value: "60"
+      - key: POOL_MIN
+        value: "1"
+      - key: POOL_MAX
+        value: "5"
+      - key: HOLD_DURATION_MINUTES
+        value: "5"
+      - key: BOOKING_STRATEGY
+        value: A
+      - key: WEBHOOK_HMAC_SECRET
+        sync: false
+      - key: IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS
+        value: "30"
+      - key: IDEMPOTENCY_KEY_RETENTION_DAYS
+        value: "7"
+      - key: PAYMENT_AMOUNT_CENTS
+        value: "5000"
+      - key: PAYMENT_SIMULATOR_DELAY_SECONDS
+        value: "1.0"
+      - key: CORS_ALLOWED_ORIGIN
+        sync: false
+      - key: ENV
+        value: production
+      - key: AUTH_RATE_LIMIT_PER_MINUTE
+        value: "5"
