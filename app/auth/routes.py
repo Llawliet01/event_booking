@@ -1,11 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException
 from psycopg import AsyncConnection, errors
 
+from app.auth.rate_limit import rate_limit_auth
 from app.auth.schemas import LoginRequest, RegisterRequest, TokenResponse
 from app.auth.security import create_access_token, hash_password, verify_password
 from app.db import get_conn
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[Depends(rate_limit_auth)])
 
 
 @router.post("/register", status_code=201, response_model=TokenResponse)

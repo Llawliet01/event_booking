@@ -216,5 +216,77 @@ ordering (and bypassing the automatic callback by sending a hand-crafted webhook
 removed the ambiguity. The lesson generalizes: a test that measures something time-sensitive
 needs to control time, not just hope its own overhead stays small enough.
 
-Later stages will add the test suite, CI, observability, k6 load tests, and the full README
-(live demo URL, demo credentials, measured benchmark results).
+## Stage 7: tests, CI, observability
+
+**Tests** (`tests/`, 45 tests, run against a real Postgres -- no mocks): the app runs
+in-process via `httpx.ASGITransport` (no Docker/uvicorn needed for the API itself, only
+`docker compose up -d postgres`), so `pytest tests/` is enough locally.
+
+- `test_concurrency.py` — the Stage 2/3 proof, automated and parametrized over both booking
+  strategies: 200 concurrent requests on one seat (exactly 1 success, 199 conflicts, checked
+  against the DB directly, not just HTTP codes) and 500 users across 100 seats (exactly 100
+  successes, zero seats with more than one active booking).
+- `test_idempotency.py` — same key twice concurrently (converges on one booking via a
+  realistic client retry on the 409-in-progress window — see note below); same key, different
+  body → 422; the in-progress/stale-reclaim mechanism driven directly at the repository level
+  for precise timing control.
+- `test_bookings.py` — hold expiry frees the seat and flips the old booking to `expired`;
+  double-cancel is rejected (409); cancelling someone else's booking is rejected (403).
+- `test_webhooks.py` / `test_reconciliation.py` — bad signature (401), malformed payload (422),
+  unknown booking (404), the same event delivered twice (exactly one row, not just one 200), a
+  hold that lapsed before a `succeeded` webhook arrived (not confirmed, flagged for review), a
+  `failed` event followed by an out-of-order `succeeded` one for the same booking (stays
+  cancelled), and `reconcile_payments()` finding and fixing a manually-crafted inconsistent row.
+- `test_fault_injection.py` — an exception raised mid-transaction (after an earlier statement
+  in the *same* transaction already ran) rolls back everything, proven by checking that earlier
+  statement's effect was undone too, not just that the final insert didn't happen; and a
+  connection dropped mid-transaction, uncommitted, leaves nothing visible from a fresh
+  connection afterward — the deterministic mechanism behind "kill the process mid-request is
+  safe," since precisely timing an actual `kill -9` mid-transaction isn't reproducible in an
+  automated test.
+
+**A real bug the test suite caught that manual testing didn't**: `test_malformed_payload_422`
+failed on its first run with a `401` instead. The test file hardcoded the webhook secret string
+used by `conftest.py`'s default, but the shell session running pytest had `.env` exported into
+its environment first, which `os.environ.setdefault()` correctly left in place — meaning the
+*app* was signing/verifying against the real `.env` secret while the *test* was still signing
+against the hardcoded one. Fixed by having the test read `get_settings().WEBHOOK_HMAC_SECRET` at
+call time instead of assuming a literal value. Re-ran the whole suite with a fully clean
+environment (`env -i`, only the exact variables the CI workflow sets) to confirm this wasn't
+papering over a deeper problem — all 45 pass either way.
+
+**A genuine race the concurrency rewrite surfaced**: the first version of the "same key sent
+twice concurrently" idempotency test assumed the pair would always resolve to a replay (as the
+live HTTP test in Stage 5 observed: `{201: 1, 200: 4}`, zero 409s). It didn't — in-process
+`asyncio.gather` races the two coroutines tighter than two real HTTP clients over a real socket
+ever did, and the losing call's own claim attempt reliably landed while the winner was still
+mid-flight, genuinely in progress (409), not yet replayable. The fix wasn't to loosen the test;
+it was to make it behave like a real client would: retry on that specific 409 and assert the
+retry converges on the same booking. The contract was never "concurrent calls never observe the
+in-progress window" — it was "the system behaves correctly when they do."
+
+**CI** (`.github/workflows/ci.yml`): runs on every push and PR, against a `postgres:16` service
+container, applying migrations then running the full suite — verified locally by running the
+exact same steps (`alembic upgrade head`, `pytest tests/ -v`) against a completely clean
+environment variable set (`env -i`, nothing but what the workflow itself exports) to confirm
+there's no hidden dependency on the local `.env`.
+
+**Observability**: `app/observability/middleware.py` assigns/propagates an `X-Request-ID` on
+every request and logs one structured JSON line per request (method, path, status, duration —
+never headers or bodies, so tokens and passwords never reach the logs) via `structlog`.
+`GET /metrics` (Prometheus text format) exposes `bookings_success_total`,
+`bookings_conflict_total`, an `http_request_duration_seconds` histogram, and
+`db_pool_connections_total`/`db_pool_connections_in_use` gauges read from the live connection
+pool at scrape time. Verified live: booked a seat, confirmed `bookings_success_total` ticked up
+by exactly 1; confirmed the pool gauges matched reality.
+
+**Rate limiting**: `app/auth/rate_limit.py` is a fixed-window limiter (`AUTH_RATE_LIMIT_PER_MINUTE`,
+default 5/min) on `/auth/register` and `/auth/login`, deliberately per-instance and in-memory —
+this project has no Redis, so a distributed limiter is out of scope; that's an accepted
+tradeoff, not a correctness bug (rate limiting doesn't touch seat-booking correctness, which is
+the thing this project's "no in-memory state" rule actually protects). Verified live: 7 rapid
+login attempts against a limit of 5/min returned `401, 401, 401, 429, 429, 429, 429` — the exact
+cutoff, accounting for 2 earlier auth calls already counted in that same window.
+
+Later stages will add k6 load tests and the full README (live demo URL, demo credentials,
+measured benchmark results).

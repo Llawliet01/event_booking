@@ -24,6 +24,7 @@ from app.idempotency.repository import (
     complete_idempotent_request,
     compute_request_hash,
 )
+from app.observability.metrics import bookings_conflict_total, bookings_success_total
 from app.payments.provider_simulator import schedule_payment_callback
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
@@ -104,9 +105,11 @@ async def create_booking(
         )
         response_code = 201
         response_body = BookingResponse.from_booking(booking).model_dump(mode="json")
+        bookings_success_total.inc()
     except SeatTakenError:
         response_code = 409
         response_body = {"detail": "seat already taken"}
+        bookings_conflict_total.inc()
     except SeatNotFoundError:
         response_code = 404
         response_body = {"detail": "seat not found"}
