@@ -392,7 +392,8 @@ API docs: <your-render-url>/docs
    tier both cap connections).
 4. After the first deploy succeeds, run `python scripts/seed.py` once against the Neon
    `DATABASE_URL` (locally, pointed at the remote DB) to create the demo user/event/seats.
-5. `.github/workflows/deploy.yml` hits Render's deploy hook on every push to `main` — add the
+5. `.github/workflows/deploy.yml` hits Render's deploy hook on every push to `master` (this
+   repo's actual default branch) — add the
    hook URL (from the Render service's Settings → Deploy Hook) as the `RENDER_DEPLOY_HOOK`
    repo secret for this to work.
 
