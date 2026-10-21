@@ -3,9 +3,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.auth.routes import router as auth_router
 from app.bookings.routes import router as bookings_router
 from app.config import get_settings
 from app.db import close_pool, open_pool
+from app.events.routes import router as events_router
 from app.health.routes import router as health_router
 
 
@@ -29,6 +31,8 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(health_router)
+    app.include_router(auth_router)
+    app.include_router(events_router)
     app.include_router(bookings_router)
     return app
 

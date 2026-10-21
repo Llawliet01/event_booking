@@ -13,10 +13,17 @@ Neither strategy uses an app-level lock or in-memory state, so both are safe
 across any number of API instances. Stage 2's naive version (a plain
 SELECT-then-INSERT with nothing synchronizing them) lived in this file first
 and is preserved in git history; this replaces it.
+
+cancel_booking and list_bookings_for_user support the owner-only cancel and
+GET /bookings/me endpoints; cancel_booking defers to
+app.bookings.state_machine.can_transition for which status changes are
+legal instead of re-deriving the rule here.
 """
 from dataclasses import dataclass
 
 from psycopg import AsyncConnection, errors
+
+from app.bookings.state_machine import can_transition
 
 
 class SeatTakenError(Exception):
@@ -25,6 +32,21 @@ class SeatTakenError(Exception):
 
 class SeatNotFoundError(Exception):
     pass
+
+
+class BookingNotFoundError(Exception):
+    pass
+
+
+class NotOwnerError(Exception):
+    pass
+
+
+class InvalidTransitionError(Exception):
+    def __init__(self, from_status: str, to_status: str) -> None:
+        self.from_status = from_status
+        self.to_status = to_status
+        super().__init__(f"cannot transition booking from {from_status!r} to {to_status!r}")
 
 
 @dataclass
@@ -126,3 +148,52 @@ async def create_hold(
     if strategy == "B":
         return await strategy_b_create_hold(conn, user_id, seat_id, hold_minutes)
     raise ValueError(f"unknown booking strategy: {strategy!r}")
+
+
+async def cancel_booking(conn: AsyncConnection, booking_id: int, user_id: int) -> Booking:
+    """Owner-only cancel, gated by the state machine. Locks the booking row
+    first (FOR UPDATE) so a concurrent operation on the same booking (e.g. a
+    payment webhook confirming it) can't race this cancel.
+    """
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, user_id, status FROM bookings WHERE id = %(id)s FOR UPDATE",
+                {"id": booking_id},
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise BookingNotFoundError()
+
+            _, owner_id, status = row
+            if owner_id != user_id:
+                raise NotOwnerError()
+            if not can_transition(status, "cancelled"):
+                raise InvalidTransitionError(status, "cancelled")
+
+            await cur.execute(
+                """
+                UPDATE bookings
+                SET status = 'cancelled', updated_at = now()
+                WHERE id = %(id)s
+                RETURNING id, seat_id, user_id, status
+                """,
+                {"id": booking_id},
+            )
+            updated = await cur.fetchone()
+    return Booking(id=updated[0], seat_id=updated[1], user_id=updated[2], status=updated[3])
+
+
+async def list_bookings_for_user(conn: AsyncConnection, user_id: int) -> list[Booking]:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT id, seat_id, user_id, status
+            FROM bookings
+            WHERE user_id = %(user_id)s
+            ORDER BY created_at DESC
+            """,
+            {"user_id": user_id},
+        )
+        rows = await cur.fetchall()
+    return [Booking(id=r[0], seat_id=r[1], user_id=r[2], status=r[3]) for r in rows]

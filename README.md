@@ -92,5 +92,34 @@ Identical result for both `BOOKING_STRATEGY=A` and `BOOKING_STRATEGY=B`, every r
 one booking succeeds, 199 get 409, and the DB confirms exactly one active booking on the seat
 — a direct before/after contrast with Stage 2's `{201: 10, 409: 190}`.
 
-Later stages will add auth, idempotency, payments, tests, k6 load tests, and the full README
+## Stage 4: auth, hold expiry, the state machine, cancel
+
+- **Auth.** `POST /auth/register` and `POST /auth/login` (argon2 password hashing, JWT access
+  tokens). `POST /bookings`, `POST /bookings/{id}/cancel`, and `GET /bookings/me` now require
+  `Authorization: Bearer <token>`; the caller's identity comes from the JWT, not the request
+  body. Duplicate email registration returns 409; bad credentials return 401; a missing/invalid
+  token returns 403/401 respectively (FastAPI's `HTTPBearer` default vs. our own check).
+- **Seat availability.** `GET /events` and `GET /events/{id}/seats` — the latter's query joins
+  to a booking row only if it's `confirmed`, or `held`/`pending_payment` with `hold_expires_at`
+  still in the future, so a lapsed hold reads as `available` with zero cleanup required.
+- **State machine.** `app/bookings/state_machine.py` is the single function (`can_transition`)
+  everything else defers to for which status changes are legal; 27 unit tests
+  (`tests/test_state_machine.py`) exhaustively cover all 25 `(from, to)` status pairs.
+- **Cancel.** `POST /bookings/{id}/cancel` — owner-only (403 otherwise), 404 if the booking
+  doesn't exist, 409 if the state machine rejects the transition (e.g. cancelling an
+  already-cancelled booking).
+- **Job hook.** `app/jobs/release_expired_holds.py` — a plain function, not wired to any
+  scheduler, for a background job to call later. Nothing in the app depends on it running:
+  every hold attempt and every availability query already treats `hold_expires_at <= now()`
+  as free on its own.
+
+All verified against a live container, not just unit tests: registered two real users,
+confirmed 409/401/403/404 on every documented error path, booked a seat and watched it flip
+from `available` to `held` in the seats listing, force-expired a hold directly in Postgres and
+confirmed both the availability query and a second user's booking attempt treated it as free
+(the original row flips to `expired` as a side effect of the second attempt's own hold-insert,
+with no cron involved), and ran `release_expired_holds()` directly to confirm it independently
+expires lapsed holds.
+
+Later stages will add idempotency keys, payments, tests, k6 load tests, and the full README
 (live demo URL, demo credentials, measured benchmark results).
