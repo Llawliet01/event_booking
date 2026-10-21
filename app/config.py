@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     WEBHOOK_HMAC_SECRET: str
     IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS: int = 30
+    IDEMPOTENCY_KEY_RETENTION_DAYS: int = 7
 
     CORS_ALLOWED_ORIGIN: str = "http://localhost:3000"
     PORT: int = 8000

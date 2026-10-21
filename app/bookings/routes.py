@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi.responses import JSONResponse
 from psycopg import AsyncConnection
 from pydantic import BaseModel
 
@@ -16,6 +17,12 @@ from app.bookings.repository import (
 )
 from app.config import get_settings
 from app.db import get_conn
+from app.idempotency.repository import (
+    Outcome,
+    begin_idempotent_request,
+    complete_idempotent_request,
+    compute_request_hash,
+)
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
@@ -40,16 +47,51 @@ class BookingResponse(BaseModel):
         )
 
 
-@router.post("", status_code=201, response_model=BookingResponse)
+@router.post("", status_code=201)
 async def create_booking(
     body: CreateBookingRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
     user_id: int = Depends(get_current_user_id),
     conn: AsyncConnection = Depends(get_conn),
-) -> BookingResponse:
-    """Stage 4: the caller's identity now comes from their JWT, not the
-    request body. Idempotency-Key handling arrives in Stage 5.
+) -> JSONResponse:
+    """Stage 5: Idempotency-Key is required. A missing header is rejected
+    by FastAPI's own header validation before this body runs (422).
+
+    The key is claimed in its own committed transaction *before* the hold
+    is attempted (app/idempotency/repository.py), so a crash partway
+    through leaves the key 'in_progress' for the stale-reclaim path to pick
+    up later, rather than silently forgetting the attempt ever happened.
+
+    A replay (same key, same body) always returns 200, even if the
+    original attempt resulted in a 409/404 -- 200 here means "here is the
+    cached result of a request that already ran," not "this succeeded."
     """
     settings = get_settings()
+    request_hash = compute_request_hash(body.model_dump())
+
+    result = await begin_idempotent_request(
+        conn,
+        user_id,
+        idempotency_key,
+        request_hash,
+        settings.IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS,
+    )
+
+    if result.outcome is Outcome.REPLAY:
+        return JSONResponse(status_code=200, content=result.response_body)
+    if result.outcome is Outcome.MISMATCH:
+        raise HTTPException(
+            status_code=422, detail="Idempotency-Key reused with a different request body"
+        )
+    if result.outcome is Outcome.IN_PROGRESS:
+        raise HTTPException(
+            status_code=409, detail="a request with this Idempotency-Key is already in progress"
+        )
+
+    # Outcome.CLAIMED: we own this key. Run the real operation, map any
+    # business-rule rejection to its response, and persist whatever we're
+    # about to return so a retry with this same key replays it instead of
+    # re-running create_hold.
     try:
         booking = await create_hold(
             conn,
@@ -58,11 +100,17 @@ async def create_booking(
             settings.HOLD_DURATION_MINUTES,
             settings.BOOKING_STRATEGY,
         )
+        response_code = 201
+        response_body = BookingResponse.from_booking(booking).model_dump(mode="json")
     except SeatTakenError:
-        raise HTTPException(status_code=409, detail="seat already taken")
+        response_code = 409
+        response_body = {"detail": "seat already taken"}
     except SeatNotFoundError:
-        raise HTTPException(status_code=404, detail="seat not found")
-    return BookingResponse.from_booking(booking)
+        response_code = 404
+        response_body = {"detail": "seat not found"}
+
+    await complete_idempotent_request(conn, user_id, idempotency_key, response_code, response_body)
+    return JSONResponse(status_code=response_code, content=response_body)
 
 
 @router.post("/{booking_id}/cancel", response_model=BookingResponse)

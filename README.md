@@ -121,5 +121,52 @@ confirmed both the availability query and a second user's booking attempt treate
 with no cron involved), and ran `release_expired_holds()` directly to confirm it independently
 expires lapsed holds.
 
-Later stages will add idempotency keys, payments, tests, k6 load tests, and the full README
-(live demo URL, demo credentials, measured benchmark results).
+## Stage 5: idempotency keys
+
+`POST /bookings` now requires an `Idempotency-Key` header (missing it is a 422 from FastAPI's
+own header validation, before the handler ever runs). `app/idempotency/repository.py` claims
+the key in its own committed transaction *before* attempting the hold, so a crash partway
+through leaves the key `in_progress` for the stale-reclaim path to pick up later rather than
+silently losing track of the attempt:
+
+1. `INSERT ... ON CONFLICT (user_id, key) DO NOTHING` — claims the key if it's unseen.
+2. Already exists and `completed` with the same request hash → **replay**: return the stored
+   response, but always as `200`, even if the original result was `201` or a `409`/`404`
+   business rejection — `200` here means "here's the cached result of a request that already
+   ran," not "this succeeded."
+3. Already exists and `completed` with a *different* hash → `422`, and the existing completed
+   record is left untouched.
+4. Already exists and `in_progress`, and still fresh (`updated_at` within
+   `IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS`, default 30s) → `409` — another request with this
+   exact key is genuinely still running.
+5. Already exists and `in_progress`, but stale (older than the timeout — the original attempt
+   most likely crashed before marking the key `completed`) → reclaim it via a CAS `UPDATE`
+   that only succeeds if it's still `in_progress` and still stale at that exact moment; a lost
+   race just loops back to re-resolve against the current row.
+
+`app/idempotency/cleanup.py` has `cleanup_old_idempotency_keys()` — same documented
+not-wired-to-a-scheduler pattern as `release_expired_holds()`.
+
+Verified directly (both over HTTP and by calling `begin_idempotent_request`/
+`complete_idempotent_request` on separate connections, since steps 2-5 above need precise
+control over *when* a key gets marked completed — something a fast-completing HTTP round trip
+doesn't leave much room for):
+- Missing header → `422`. Fresh create → `201`.
+- Same key + same body, replayed → `200` with the identical stored booking.
+- Same key + different body → `422`; the seat the mismatched body named was never touched.
+- Two connections racing the same unclaimed key, neither completing it: first → `CLAIMED`,
+  second → `IN_PROGRESS` (the live 409 path). A third call after the first completes → `REPLAY`.
+- A claimed-but-never-completed key, immediately retried → `IN_PROGRESS` (correctly still
+  fresh); after forcing its `updated_at` back by an hour (simulating a crashed attempt, no
+  app-code changes involved) → the same key, now with a *different* body, is successfully
+  reclaimed (`CLAIMED`), and the stored `request_hash` updates to match the new attempt.
+- `cleanup_old_idempotency_keys(retention_days=7)` against 4 rows aged to 10 days old deleted
+  all 4.
+- Five genuinely concurrent HTTP requests with the same fresh key against the real endpoint
+  came back `{201: 1, 200: 4}` with zero 409s — the hold itself is fast enough to complete
+  before the other requests' claims resolve, so they land on `REPLAY` rather than
+  `IN_PROGRESS`. Both are correct outcomes of the same mechanism; which one you see depends on
+  how long the claimed request takes to finish.
+
+Later stages will add payments, tests, k6 load tests, and the full README (live demo URL,
+demo credentials, measured benchmark results).
